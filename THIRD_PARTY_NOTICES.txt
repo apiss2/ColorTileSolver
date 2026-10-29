@@ -1,0 +1,23 @@
+ColorTile Solver 1.0
+
+The application source is independently implemented and distributed under the
+MIT License in LICENSE.txt.
+
+Windows executables are built using LLVM-MinGW 20261020 and include statically
+linked compiler/runtime components. Applicable notices are included in:
+
+  licenses/LLVM-LICENSE.txt
+  licenses/COPYING.MinGW-w64-runtime.txt
+  licenses/COPYING.MinGW-w64.txt
+  licenses/COPYING.winpthreads.txt
+
+Windows system libraries (WIC, Win32, common controls) are supplied by Windows
+and are not bundled. Wine, the Linux cross-compilation toolchain, test fonts,
+and Python/Pillow are not bundled with this application.
+
+The sample screenshot in examples/sample.png was supplied by the user. Its
+presence does not transfer ownership of the underlying game artwork.
+
+Rule reference: https://www.gamesaien.com/game/color_tiles/guide/
+Original project reviewed: https://github.com/xkikeg/colortile
+No code from that project is included.

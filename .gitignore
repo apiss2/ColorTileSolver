@@ -1,0 +1,28 @@
+﻿# ビルド結果とローカルの配布用ファイル
+/.build/
+/build/
+/build-*/
+/cmake-build-*/
+/.local-distribution/
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.pdb
+*.ilk
+*.so
+*.so.*
+*.dylib
+*.zip
+*.7z
+
+# エディターとテスト実行時の一時ファイル
+/.vs/
+/.venv/
+__pycache__/
+*.pyc
+/result.json
+/gui.bmp
+/gui.bmp.json
