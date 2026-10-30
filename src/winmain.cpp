@@ -18,6 +18,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -27,11 +28,14 @@
 #include <thread>
 #include <vector>
 #include "core.h"
+#include "desktop.h"
+#include "live_playback.h"
 
 namespace {
 constexpr wchar_t kClassName[] = L"ColorTileSolverWindow";
 constexpr wchar_t kCalibrationClass[] = L"ColorTileSolverCalibration";
-constexpr UINT_PTR kUiTimer = 1, kPlayTimer = 2, kSmokeTimer = 3;
+constexpr UINT_PTR kUiTimer = 1, kPlayTimer = 2, kSmokeTimer = 3, kLiveTimer = 4;
+constexpr int kEscapeHotkey = 0x4354, kF8Hotkey = 0x4355;
 constexpr UINT kWorkerDone = WM_APP + 10;
 constexpr COLORREF kBackground = RGB(242, 245, 250);
 constexpr COLORREF kInk = RGB(27, 42, 65);
@@ -41,8 +45,10 @@ constexpr COLORREF kBorder = RGB(220, 227, 236);
 constexpr int kPaletteStart = 200;
 enum ControlId { Open = 101, Paste, Example, ImageView, Calibrate, Edit,
     Limit, Start, Stop, Reset, Previous, Next, Play, RouteList, Export,
-    ImportBoard, SaveBoard, Mode };
+    ImportBoard, SaveBoard, Mode, PlaybackInterval, PlaybackSpin,
+    ScreenAuto, ScreenHint, LiveStop, ExitApp };
 const wchar_t* const kColorNames[] = {L"空白", L"灰", L"青", L"水色", L"緑", L"黄", L"茶", L"橙", L"赤", L"桃", L"紫"};
+enum class ScreenMode { Off, Automatic, Hint };
 
 std::wstring wide(const std::string& s) {
     if (s.empty()) return {};
@@ -79,7 +85,7 @@ std::wstring budget_string(double seconds) {
 }
 struct App {
     HWND hwnd = nullptr;
-    HWND limit = nullptr, route = nullptr, mode = nullptr;
+    HWND limit = nullptr, route = nullptr, mode = nullptr, playbackInterval = nullptr;
     HFONT font = nullptr, fontSmall = nullptr, fontTitle = nullptr, fontSection = nullptr, fontNumber = nullptr;
     double scale = 1.0;
     ct::Image image;
@@ -91,6 +97,7 @@ struct App {
     std::vector<ct::Move> moves;
     int step = 0;
     bool showImage = false, editMode = false, playing = false;
+    int playbackIntervalMs = 600;
     int selectedColor = 8;
     RECT boardRect{}, mainCard{}, sideCard{};
     double cellSize = 1;
@@ -114,7 +121,19 @@ struct App {
     double smokeSolve = -1.0;
     std::wstring capturePath;
     int smokeExitCode = 0;
+    ScreenMode screenMode = ScreenMode::Off;
+    bool screenSelecting = false, screenWaiting = false, screenActive = false;
+    bool escapeRegistered = false, f8Registered = false, screenMinimized = false;
+    desktop::Target screenTarget;
+    ct::GridGeometry screenGrid;
+    ct::VerifiedPlayback screenPlayback;
+    WINDOWPLACEMENT screenPlacement{sizeof(WINDOWPLACEMENT)};
+    uint64_t screenReadyAt = 0;
+    int screenHintStep = -1;
+    std::wstring screenStopNotice;
 };
+void stop_screen(App& a, const std::wstring& message, bool restore = true);
+void activate_screen(App& a);
 int px(const App& a, int v) { return static_cast<int>(std::lround(v * a.scale)); }
 void fill(HDC dc, RECT r, COLORREF c) { HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br); }
 void box(HDC dc, RECT r, COLORREF color, int radius, COLORREF border = kBorder, int penWidth = 1) {
@@ -141,40 +160,97 @@ void create_fonts(App& a) {
     a.font = make(14, FW_NORMAL); a.fontSmall = make(12, FW_NORMAL);
     a.fontTitle = make(26, FW_SEMIBOLD); a.fontSection = make(15, FW_SEMIBOLD); a.fontNumber = make(22, FW_SEMIBOLD);
 }
+void create_menu(App& a) {
+    HMENU menu = CreateMenu(), file = CreatePopupMenu(), board = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING, Open, L"画像を開く(&O)...\tCtrl+O");
+    AppendMenuW(file, MF_STRING, Paste, L"画像を貼り付け(&V)\tCtrl+V");
+    AppendMenuW(file, MF_STRING, Example, L"サンプルを開く(&E)");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, ImportBoard, L"盤面を開く(&B)...");
+    AppendMenuW(file, MF_STRING, SaveBoard, L"盤面を保存(&S)...\tCtrl+S");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING, ExitApp, L"終了(&X)");
+    AppendMenuW(board, MF_STRING, ImageView, L"元画像と格子を表示(&I)");
+    AppendMenuW(board, MF_STRING, Calibrate, L"認識位置を調整(&C)...");
+    AppendMenuW(board, MF_STRING, Edit, L"盤面を修正(&E)");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"ファイル(&F)");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(board), L"盤面(&B)");
+    SetMenu(a.hwnd, menu);
+}
+void display_playback_interval(App& a) {
+    SetWindowTextW(a.playbackInterval, seconds_string(a.playbackIntervalMs / 1000.0).c_str());
+    SendDlgItemMessageW(a.hwnd, PlaybackSpin, UDM_SETPOS32, 0, a.playbackIntervalMs / 100);
+}
+bool commit_playback_interval(App& a, bool reportError = true) {
+    wchar_t value[64]{}; GetWindowTextW(a.playbackInterval, value, 64);
+    wchar_t* end = nullptr;
+    const double seconds = wcstod(value, &end);
+    while (end && iswspace(*end)) ++end;
+    const double tenths = seconds * 10.0;
+    const bool valid = end != value && end && !*end && std::isfinite(seconds) &&
+                       seconds >= 0.1 && seconds <= 60.0 && std::abs(tenths - std::round(tenths)) < 1e-7;
+    if (!valid) {
+        display_playback_interval(a);
+        if (reportError) MessageBoxW(a.hwnd, L"再生間隔は0.1～60.0秒の範囲で、0.1秒単位で入力してください。", L"再生間隔", MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    a.playbackIntervalMs = static_cast<int>(std::lround(tenths)) * 100;
+    display_playback_interval(a);
+    if (a.playing) SetTimer(a.hwnd, kPlayTimer, a.playbackIntervalMs, nullptr);
+    return true;
+}
 void layout(App& a) {
     RECT rc; GetClientRect(a.hwnd, &rc);
     const int w = static_cast<int>(rc.right / a.scale), h = static_cast<int>(rc.bottom / a.scale);
     auto place = [&](int id, int x, int y, int cw, int ch) {
         MoveWindow(GetDlgItem(a.hwnd, id), px(a, x), px(a, y), px(a, cw), px(a, ch), TRUE);
     };
-    place(Open, 24, 88, 122, 34); place(Paste, 154, 88, 126, 34); place(Example, 288, 88, 88, 34);
-    place(ImageView, 384, 88, 106, 34); place(Calibrate, 498, 88, 106, 34); place(Edit, 612, 88, 106, 34);
-    place(ImportBoard, 726, 88, 100, 34); place(SaveBoard, 834, 88, 88, 34);
-    place(Mode, 77, 139, 151, 180); place(Limit, 238, 137, 79, 32);
-    place(Start, 368, 135, 144, 38); place(Stop, 522, 135, 70, 38);
+    place(Mode, 77, 22, 170, 180); place(Limit, 258, 20, 79, 32);
+    place(Start, 378, 18, 148, 38); place(Stop, 536, 18, 70, 38);
+    place(ScreenAuto, 24, 70, 210, 36); place(ScreenHint, 244, 70, 252, 36);
+    place(LiveStop, 506, 70, 140, 36);
     const int paletteX = 618;
-    for (int c = 0; c <= 10; ++c) place(kPaletteStart + c, paletteX + c * 29, 141, 25, 25);
-    const int mainWidth = w - 380, cardHeight = h - 294;
-    a.mainCard = {px(a, 24), px(a, 190), px(a, 24 + mainWidth), px(a, 190 + cardHeight)};
-    a.sideCard = {px(a, w - 332), px(a, 190), px(a, w - 24), px(a, h - 28)};
-    place(RouteList, w - 314, 380, 272, h - 469);
+    for (int c = 0; c <= 10; ++c) place(kPaletteStart + c, paletteX + c * 29, 25, 25, 25);
+    const int mainWidth = w - 380;
+    a.mainCard = {px(a, 24), px(a, 124), px(a, 24 + mainWidth), px(a, h - 130)};
+    a.sideCard = {px(a, w - 332), px(a, 124), px(a, w - 24), px(a, h - 28)};
+    place(RouteList, w - 314, 314, 272, h - 403);
     place(Export, w - 314, h - 73, 272, 32);
-    place(Reset, 24, h - 88, 86, 34); place(Previous, 120, h - 88, 86, 34);
-    place(Next, 216, h - 88, 86, 34); place(Play, 312, h - 88, 112, 34);
+    place(Reset, 24, h - 96, 68, 34); place(Previous, 100, h - 96, 60, 34);
+    place(Next, 168, h - 96, 60, 34); place(Play, 236, h - 96, 100, 34);
+    place(PlaybackInterval, 386, h - 94, 60, 30); place(PlaybackSpin, 446, h - 94, 20, 30);
     InvalidateRect(a.hwnd, nullptr, FALSE);
 }
 void update_enabled(App& a) {
-    for (int id : {Open, Paste, Example, ImportBoard, Calibrate, Edit})
-        EnableWindow(GetDlgItem(a.hwnd, id), !a.running && (id != Calibrate || !a.image.rgb.empty()));
-    EnableWindow(GetDlgItem(a.hwnd, Start), a.haveBoard && !a.running);
+    HMENU menu = GetMenu(a.hwnd);
+    const bool screenBusy = a.screenMode != ScreenMode::Off || a.screenSelecting;
+    const bool busy = a.running || screenBusy;
+    auto enable_menu = [&](int id, bool enabled) { EnableMenuItem(menu, id, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED)); };
+    for (int id : {Open, Paste, Example, ImportBoard}) enable_menu(id, !busy);
+    enable_menu(Calibrate, !busy && !a.image.rgb.empty());
+    enable_menu(Edit, a.haveBoard && !busy);
+    enable_menu(SaveBoard, a.haveBoard && !busy);
+    enable_menu(ImageView, !screenBusy && !a.image.rgb.empty());
+    CheckMenuItem(menu, ImageView, MF_BYCOMMAND | (a.showImage ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, Edit, MF_BYCOMMAND | (a.editMode ? MF_CHECKED : MF_UNCHECKED));
+    DrawMenuBar(a.hwnd);
+    EnableWindow(GetDlgItem(a.hwnd, Start), a.haveBoard && !busy);
     EnableWindow(GetDlgItem(a.hwnd, Stop), a.running);
-    EnableWindow(a.mode, !a.running);
-    EnableWindow(a.limit, !a.running && SendMessageW(a.mode, CB_GETCURSEL, 0, 0) == 0);
-    EnableWindow(GetDlgItem(a.hwnd, SaveBoard), a.haveBoard && !a.running);
-    EnableWindow(GetDlgItem(a.hwnd, ImageView), !a.image.rgb.empty());
+    EnableWindow(a.mode, !busy);
+    EnableWindow(a.limit, !busy && SendMessageW(a.mode, CB_GETCURSEL, 0, 0) == 0);
+    EnableWindow(GetDlgItem(a.hwnd, ScreenAuto), !busy);
+    EnableWindow(GetDlgItem(a.hwnd, ScreenHint), !busy);
+    EnableWindow(GetDlgItem(a.hwnd, LiveStop), a.screenMode != ScreenMode::Off);
+    EnableWindow(a.playbackInterval, !screenBusy);
+    EnableWindow(GetDlgItem(a.hwnd, PlaybackSpin), !screenBusy);
     const bool has = !a.moves.empty();
-    for (int id : {Reset, Previous, Next, Play, Export}) EnableWindow(GetDlgItem(a.hwnd, id), has);
-    for (int c = 0; c <= 10; ++c) EnableWindow(GetDlgItem(a.hwnd, kPaletteStart + c), a.haveBoard && a.editMode && !a.running);
+    for (int id : {Reset, Previous, Next, Play, Export}) EnableWindow(GetDlgItem(a.hwnd, id), has && !screenBusy);
+    EnableWindow(a.route, !screenBusy);
+    for (int c = 0; c <= 10; ++c) {
+        HWND palette = GetDlgItem(a.hwnd, kPaletteStart + c);
+        EnableWindow(palette, a.haveBoard && a.editMode && !busy);
+        ShowWindow(palette, a.editMode ? SW_SHOW : SW_HIDE);
+    }
 }
 void stop_play(App& a) {
     a.playing = false; KillTimer(a.hwnd, kPlayTimer); SetWindowTextW(GetDlgItem(a.hwnd, Play), L"自動再生");
@@ -237,7 +313,6 @@ void accept_recognition(App& a, ct::Recognition r) {
         if (a.geometryUncertain) a.detail = L"端の空白により位置がずれる可能性があります。「元画像を表示」で格子を確認してください。";
         a.showImage = false;
     }
-    SetWindowTextW(GetDlgItem(a.hwnd, ImageView), a.showImage ? L"盤面を表示" : L"元画像を表示");
     update_enabled(a); InvalidateRect(a.hwnd, nullptr, FALSE);
 }
 bool load_image_file(const std::wstring& file, ct::Image& out, std::wstring& error) {
@@ -307,7 +382,7 @@ void paste_image(App& a) {
     a.image = std::move(im); a.imageName = L"クリップボード"; make_bgra(a); accept_recognition(a, ct::recognize(a.image));
 }
 void start_solver(App& a) {
-    if (a.running || !a.haveBoard) return;
+    if (a.running || a.screenActive || !a.haveBoard) return;
     std::string error;
     if (!ct::validate_board(a.original, &error)) { MessageBoxW(a.hwnd, wide(error).c_str(), L"盤面を確認してください", MB_OK | MB_ICONWARNING); return; }
     if ((a.uncertain > 0 || a.geometryUncertain) && MessageBoxW(a.hwnd, L"盤面の色または位置に不確かな箇所があります。元画像と格子を確認してください。この盤面で探索しますか？", L"認識結果の確認", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
@@ -318,7 +393,7 @@ void start_solver(App& a) {
         MessageBoxW(a.hwnd, L"時間は0.1～86,400秒の数値で入力してください。小数も指定できます。", L"探索時間", MB_OK | MB_ICONWARNING); return;
     }
     if (a.worker.joinable()) a.worker.join();
-    clear_solution(a); a.editMode = false; SetWindowTextW(GetDlgItem(a.hwnd, Edit), L"盤面を修正");
+    clear_solution(a); a.editMode = false; a.screenStopNotice.clear();
     a.running = true; a.cancel.store(false); a.runTimed = timed; a.runBudget = timed ? budget : 0;
     a.runStarted = std::chrono::steady_clock::now(); a.shown.best_remaining = tile_count(a.original);
     a.headline = L"全消しの手順を探索しています"; a.detail = L"暫定の手順は探索中でも確認できます。停止すると、その時点の結果を残します。";
@@ -367,6 +442,13 @@ void consume_worker(App& a) {
             a.headline = L"探索を停止しました"; a.detail = L"停止までに見つかった手順を表示しています。最短性は未確認です。"; break;
         default: a.finalStatus = L"エラー"; a.headline = L"探索を開始できませんでした"; a.detail = wide(r.message); break;
         }
+        if (a.screenWaiting) {
+            if (r.remaining == 0 && (r.status == ct::SolveStatus::Optimal || r.status == ct::SolveStatus::Feasible)) activate_screen(a);
+            else stop_screen(a, L"探索を完了して全消し手順を取得できなかったため、画面操作を開始しませんでした。");
+        }
+        if (!a.screenStopNotice.empty()) {
+            a.headline = L"画面操作を停止しました"; a.detail = a.screenStopNotice;
+        }
         update_enabled(a);
     }
     if (gotProgress || gotResult) InvalidateRect(a.hwnd, nullptr, FALSE);
@@ -376,6 +458,141 @@ void set_step(App& a, int step) {
     if (a.step < static_cast<int>(a.moves.size())) SendMessageW(a.route, LB_SETCURSEL, a.step, 0);
     else SendMessageW(a.route, LB_SETCURSEL, static_cast<WPARAM>(-1), 0);
     InvalidateRect(a.hwnd, nullptr, FALSE);
+}
+void stop_screen(App& a, const std::wstring& message, bool restore) {
+    const bool pending = a.screenWaiting;
+    a.screenMode = ScreenMode::Off; a.screenWaiting = false; a.screenActive = false;
+    KillTimer(a.hwnd, kLiveTimer); desktop::destroy_hint(); a.screenHintStep = -1;
+    if (a.escapeRegistered) UnregisterHotKey(a.hwnd, kEscapeHotkey);
+    if (a.f8Registered) UnregisterHotKey(a.hwnd, kF8Hotkey);
+    a.escapeRegistered = false; a.f8Registered = false;
+    if (pending && a.running) { a.cancel.store(true); a.screenStopNotice = message; }
+    a.headline = L"画面操作を停止しました"; a.detail = message;
+    if (a.screenMinimized) {
+        a.screenMinimized = false;
+        if (restore && IsWindow(a.hwnd)) {
+            SetWindowPlacement(a.hwnd, &a.screenPlacement);
+            ShowWindow(a.hwnd, a.screenPlacement.showCmd == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+            SetForegroundWindow(a.hwnd);
+        }
+    }
+    update_enabled(a); InvalidateRect(a.hwnd, nullptr, FALSE);
+}
+RECT screen_cell_rect(const App& a, int index) {
+    const auto& g = a.screenGrid;
+    const int col = index % g.columns, row = index / g.columns;
+    return {a.screenTarget.selection.left + static_cast<LONG>(std::lround(g.left + col * g.cell_width)),
+            a.screenTarget.selection.top + static_cast<LONG>(std::lround(g.top + row * g.cell_height)),
+            a.screenTarget.selection.left + static_cast<LONG>(std::lround(g.left + (col + 1) * g.cell_width)),
+            a.screenTarget.selection.top + static_cast<LONG>(std::lround(g.top + (row + 1) * g.cell_height))};
+}
+void activate_screen(App& a) {
+    std::string routeError;
+    if (!a.screenPlayback.reset(a.original, a.moves, a.screenMode == ScreenMode::Automatic, a.playbackIntervalMs, &routeError)) {
+        stop_screen(a, L"全消し手順を検証できなかったため、画面操作を開始しませんでした。"); return;
+    }
+    stop_play(a); set_step(a, 0);
+    a.screenPlacement.length = sizeof(WINDOWPLACEMENT);
+    if (!GetWindowPlacement(a.hwnd, &a.screenPlacement)) {
+        stop_screen(a, L"ウィンドウの状態を保存できませんでした。"); return;
+    }
+    a.screenWaiting = false; a.screenActive = true; a.screenMinimized = true;
+    ShowWindow(a.hwnd, SW_MINIMIZE);
+    std::wstring error;
+    if (!desktop::focus_target(a.screenTarget, error)) { stop_screen(a, error); return; }
+    a.screenReadyAt = GetTickCount64() + 350;
+    if (!SetTimer(a.hwnd, kLiveTimer, 50, nullptr)) { stop_screen(a, L"画面確認用のタイマーを開始できませんでした。"); return; }
+    a.headline = a.screenMode == ScreenMode::Automatic ? L"指定した盤面を自動操作しています" : L"ゲーム画面に次の手を表示しています";
+    a.detail = L"Esc または F8 で停止します。盤面の変化を確認してから次へ進みます。";
+}
+void begin_screen(App& a, ScreenMode mode) {
+    if (a.running || a.screenMode != ScreenMode::Off || a.screenSelecting) return;
+    if (!commit_playback_interval(a)) return;
+    // Validate the budget before opening the full-screen selector.
+    if (SendMessageW(a.mode, CB_GETCURSEL, 0, 0) == 0) {
+        wchar_t value[64]{}; GetWindowTextW(a.limit, value, 64); wchar_t* end = nullptr;
+        const double budget = wcstod(value, &end);
+        if (end == value || *end || !std::isfinite(budget) || budget < 0.1 || budget > 86400) {
+            MessageBoxW(a.hwnd, L"探索時間は0.1～86,400秒で入力してください。", L"探索時間", MB_OK | MB_ICONINFORMATION); return;
+        }
+    }
+    stop_play(a); desktop::Target target; ct::Image image; std::wstring error;
+    a.screenSelecting = true; update_enabled(a);
+    const bool selected = desktop::select_region(a.hwnd, target, image, error);
+    a.screenSelecting = false; update_enabled(a);
+    if (!selected) {
+        if (!error.empty()) MessageBoxW(a.hwnd, error.c_str(), L"盤面の範囲指定", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    a.image = std::move(image); a.imageName = L"画面で指定した盤面"; make_bgra(a);
+    accept_recognition(a, ct::recognize(a.image));
+    const auto& g = a.recognition.grid;
+    if (!a.haveBoard || a.uncertain || a.geometryUncertain || tile_count(a.original) == 0 ||
+        g.cell_width < 6 || g.cell_height < 6 || g.left < 0 || g.top < 0 ||
+        g.left + g.columns * g.cell_width > a.image.width || g.top + g.rows * g.cell_height > a.image.height) {
+        a.detail = L"色と格子を確実に認識できませんでした。23列×15行の盤面全体が入るように範囲を指定し直してください。";
+        InvalidateRect(a.hwnd, nullptr, FALSE);
+        MessageBoxW(a.hwnd, a.detail.c_str(), L"画面操作を開始できません", MB_OK | MB_ICONINFORMATION); return;
+    }
+    // Global escape is required before arming external input. Never continue
+    // if another application prevents us from reserving the stop key.
+    a.escapeRegistered = RegisterHotKey(a.hwnd, kEscapeHotkey, MOD_NOREPEAT, VK_ESCAPE) != 0;
+    if (!a.escapeRegistered) {
+        MessageBoxW(a.hwnd, L"停止用のEscキーを登録できませんでした。他の画面操作ツールを終了してから再度お試しください。", L"画面操作を開始できません", MB_OK | MB_ICONINFORMATION); return;
+    }
+    a.f8Registered = RegisterHotKey(a.hwnd, kF8Hotkey, MOD_NOREPEAT, VK_F8) != 0;
+    a.screenTarget = target; a.screenGrid = g; a.screenMode = mode; a.screenWaiting = true;
+    start_solver(a);
+    if (!a.running) { stop_screen(a, L"探索を開始できなかったため、画面操作を中止しました。"); return; }
+    a.detail = mode == ScreenMode::Automatic ? L"探索が終わるとゲームを前面にして自動クリックします。Escで中止できます。" : L"探索が終わるとゲーム画面で次の手が光ります。Escで中止できます。";
+    update_enabled(a); InvalidateRect(a.hwnd, nullptr, FALSE);
+}
+void tick_screen(App& a) {
+    if (!a.screenActive || a.screenMode == ScreenMode::Off) return;
+    if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_F8) & 0x8000)) {
+        stop_screen(a, L"停止キーが押されたため中止しました。"); return;
+    }
+    const uint64_t now = GetTickCount64();
+    if (now < a.screenReadyAt) return;
+    ct::Image frame; std::wstring error;
+    if (!desktop::capture(a.screenTarget, frame, error)) { stop_screen(a, error); return; }
+    auto observed = ct::sample_grid(frame, a.screenGrid);
+    const bool reliable = observed.ok && observed.uncertain_cells == 0;
+    const auto action = a.screenPlayback.observe(observed.ok ? &observed.board : nullptr, reliable, now);
+    if (action == ct::PlaybackAction::BoardChanged) {
+        stop_screen(a, L"盤面が予定した状態と一致しないため停止しました。範囲を指定し直してください。"); return;
+    }
+    if (action == ct::PlaybackAction::NoResponse) {
+        stop_screen(a, L"クリック後の盤面変化を2秒以内に確認できなかったため停止しました。クリックは再送していません。"); return;
+    }
+    if (action == ct::PlaybackAction::Complete) {
+        set_step(a, static_cast<int>(a.screenPlayback.step()));
+        stop_screen(a, L"指定した盤面の全消しを確認しました。");
+        a.headline = L"画面上の全消しが完了しました"; InvalidateRect(a.hwnd, nullptr, FALSE); return;
+    }
+    if (action == ct::PlaybackAction::Advanced) set_step(a, static_cast<int>(a.screenPlayback.step()));
+    const int next = a.screenPlayback.next_cell();
+    if (next < 0) return;
+    const RECT cell = screen_cell_rect(a, next);
+    if (action == ct::PlaybackAction::Click) {
+        desktop::hide_hint();
+        const POINT center{cell.left + (cell.right - cell.left) / 2, cell.top + (cell.bottom - cell.top) / 2};
+        if (!desktop::click_cell(a.screenTarget, center, error)) { stop_screen(a, error); return; }
+        if (!a.screenPlayback.clicked(GetTickCount64())) { stop_screen(a, L"画面操作の状態を確認できませんでした。"); return; }
+    }
+    // Display a hint only on a verified current board, never on an uncertain
+    // or transitional frame. It must remain transparent to the game's clicks.
+    if (a.screenMode == ScreenMode::Hint) {
+        if (reliable && observed.board.cells == a.screenPlayback.expected().cells) {
+            const int step = static_cast<int>(a.screenPlayback.step());
+            if (a.screenHintStep != step) {
+                if (!desktop::show_hint(a.screenTarget, cell, step + 1, static_cast<int>(a.screenPlayback.size()))) {
+                    stop_screen(a, L"次の手の表示を作成できませんでした。"); return;
+                }
+                a.screenHintStep = step;
+            }
+        } else { desktop::hide_hint(); a.screenHintStep = -1; }
+    }
 }
 void export_route(App& a) {
     if (a.moves.empty()) return;
@@ -553,10 +770,9 @@ void paint(App& a) {
     PAINTSTRUCT ps; HDC screen = BeginPaint(a.hwnd, &ps); RECT rc; GetClientRect(a.hwnd, &rc);
     HDC dc = CreateCompatibleDC(screen); HBITMAP bitmap = CreateCompatibleBitmap(screen, std::max(1L, rc.right), std::max(1L, rc.bottom)); auto oldBitmap = SelectObject(dc, bitmap);
     fill(dc, rc, kBackground);
-    text(dc, L"ColorTile Solver", {px(a, 24), px(a, 18), rc.right - px(a, 24), px(a, 52)}, a.fontTitle);
-    text(dc, L"画像から盤面を読み取り、全消しの最短手順を探索", {px(a, 26), px(a, 55), rc.right - px(a, 24), px(a, 78)}, a.fontSmall, kMuted);
-    text(dc, L"モード", {px(a, 26), px(a, 144), px(a, 77), px(a, 168)}, a.font, kMuted);
-    text(dc, L"秒", {px(a, 326), px(a, 144), px(a, 359), px(a, 168)}, a.font, kMuted);
+    text(dc, L"モード", {px(a, 26), px(a, 27), px(a, 77), px(a, 51)}, a.font, kMuted);
+    text(dc, L"秒", {px(a, 346), px(a, 27), px(a, 370), px(a, 51)}, a.font, kMuted);
+    text(dc, L"Esc で画面操作を停止", {px(a, 664), px(a, 77), rc.right - px(a, 24), px(a, 100)}, a.fontSmall, kMuted, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     box(dc, a.mainCard, RGB(255, 255, 255), px(a, 12)); box(dc, a.sideCard, RGB(255, 255, 255), px(a, 12));
     RECT mainTitle{a.mainCard.left + px(a, 20), a.mainCard.top + px(a, 17), a.mainCard.right - px(a, 20), a.mainCard.top + px(a, 40)};
     std::wstring title = a.showImage ? L"元画像と認識位置" : a.editMode ? L"盤面を修正（色を選んでマスをクリック）" : L"盤面と次のクリック位置";
@@ -567,7 +783,7 @@ void paint(App& a) {
     else {
         RECT blank{content.left + px(a, 18), content.top + px(a, 45), content.right - px(a, 18), content.bottom};
         text(dc, L"画像をここにドロップ", blank, a.fontNumber, kMuted, DT_CENTER | DT_TOP);
-        blank.top += px(a, 42); text(dc, L"PNG / JPEG / BMP\n\nCtrl+V でスクリーンショットを貼り付けられます。\n「サンプル」から動作を試せます。", blank, a.font, kMuted, DT_CENTER | DT_TOP | DT_WORDBREAK);
+        blank.top += px(a, 42); text(dc, L"PNG / JPEG / BMP\n\nCtrl+O で画像を開く  /  Ctrl+V で貼り付け\n「ファイル」のサンプルから動作を試せます。", blank, a.font, kMuted, DT_CENTER | DT_TOP | DT_WORDBREAK);
     }
     RECT side{a.sideCard.left + px(a, 18), a.sideCard.top + px(a, 15), a.sideCard.right - px(a, 18), a.sideCard.top + px(a, 40)};
     COLORREF statusColor = a.provenOptimal ? RGB(16, 136, 83) : kAccent;
@@ -588,7 +804,9 @@ void paint(App& a) {
     text(dc, L"手順一覧（行と列は1から）", side, a.fontSection);
     const int bottom = static_cast<int>(rc.bottom / a.scale);
     std::wstring stepInfo = a.moves.empty() ? L"" : std::to_wstring(a.step) + L" / " + std::to_wstring(a.moves.size()) + L" 手を表示";
-    text(dc, stepInfo, {px(a, 440), px(a, bottom - 81), a.mainCard.right, px(a, bottom - 52)}, a.fontSmall, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, stepInfo, {px(a, 26), px(a, bottom - 124), a.mainCard.right, px(a, bottom - 100)}, a.fontSmall, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, L"間隔", {px(a, 348), px(a, bottom - 94), px(a, 384), px(a, bottom - 64)}, a.fontSmall, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, L"秒", {px(a, 474), px(a, bottom - 94), px(a, 496), px(a, bottom - 64)}, a.fontSmall, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     text(dc, a.headline, {px(a, 26), px(a, bottom - 44), a.mainCard.right, px(a, bottom - 23)}, a.fontSmall, kInk, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     text(dc, a.detail, {px(a, 26), px(a, bottom - 23), a.mainCard.right, px(a, bottom - 3)}, a.fontSmall, kMuted, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     BitBlt(screen, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
@@ -624,7 +842,7 @@ void edit_cell(App& a, int cell, int color) {
     if (a.recognition.confidence.size() == a.original.cells.size()) a.recognition.confidence[cell] = 1;
     a.uncertain = static_cast<int>(std::count_if(a.recognition.confidence.begin(), a.recognition.confidence.end(), [](float c) { return c < 0.70f; }));
     a.headline = L"盤面を修正しました  /  " + std::to_wstring(tile_count(a.original)) + L" 枚";
-    a.detail = L"修正が終わったら「修正を終了」または「最短手順を探索」を押してください。";
+    a.detail = L"修正が終わったら「盤面」メニューで修正を解除するか、「最短手順を探索」を押してください。";
     update_enabled(a); InvalidateRect(a.hwnd, nullptr, FALSE);
 }
 void load_example(App& a) {
@@ -634,13 +852,14 @@ void load_example(App& a) {
         if (std::filesystem::exists(candidate)) { open_path(a, candidate.wstring()); return; }
     MessageBoxW(a.hwnd, L"examples\\sample.png が見つかりません。ZIPをすべて展開してから起動してください。", L"サンプル画像", MB_OK | MB_ICONINFORMATION);
 }
-bool capture_client(App& a) {
+bool capture_window(App& a) {
     if (a.capturePath.empty()) return true;
     RedrawWindow(a.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-    RECT r{}; GetClientRect(a.hwnd, &r);
-    const int w = r.right, h = r.bottom;
+    // Include the native menu bar and title bar in diagnostic previews.
+    RECT r{}; GetWindowRect(a.hwnd, &r);
+    const int w = r.right - r.left, h = r.bottom - r.top;
     if (w <= 0 || h <= 0) return false;
-    POINT origin{0, 0}; ClientToScreen(a.hwnd, &origin);
+    POINT origin{r.left, r.top};
     HDC screen = GetDC(nullptr), memory = CreateCompatibleDC(screen);
     HBITMAP bitmap = CreateCompatibleBitmap(screen, w, h);
     auto old = SelectObject(memory, bitmap);
@@ -678,11 +897,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         HDC dc = GetDC(hwnd); a->scale = GetDeviceCaps(dc, LOGPIXELSX) / 96.0; ReleaseDC(hwnd, dc); create_fonts(*a);
+        create_menu(*a);
         for (auto item : std::initializer_list<std::pair<int, const wchar_t*>>{
-            {Open, L"画像を開く"}, {Paste, L"貼り付け Ctrl+V"}, {Example, L"サンプル"}, {ImageView, L"元画像を表示"},
-            {Calibrate, L"位置を調整"}, {Edit, L"盤面を修正"}, {ImportBoard, L"盤面を開く"}, {SaveBoard, L"盤面保存"},
             {Start, L"最短手順を探索"}, {Stop, L"停止"}, {Reset, L"最初へ"}, {Previous, L"前へ"}, {Next, L"次へ"},
-            {Play, L"自動再生"}, {Export, L"手順をCSVで保存"}}) make_button(*a, item.first, item.second);
+            {Play, L"自動再生"}, {Export, L"手順をCSVで保存"},
+            {ScreenAuto, L"画面を指定して自動操作"}, {ScreenHint, L"画面を指定して次の手を表示"},
+            {LiveStop, L"画面操作を停止"}}) make_button(*a, item.first, item.second);
         for (int c = 0; c <= 10; ++c) make_button(*a, kPaletteStart + c, kColorNames[c]);
         a->mode = CreateWindowW(WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(Mode), GetModuleHandleW(nullptr), nullptr); set_control_font(a->mode, a->font);
@@ -690,6 +910,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(a->mode, CB_SETCURSEL, 0, 0);
         a->limit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10.0", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(Limit), GetModuleHandleW(nullptr), nullptr); set_control_font(a->limit, a->font);
+        a->playbackInterval = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.6", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(PlaybackInterval), GetModuleHandleW(nullptr), nullptr); set_control_font(a->playbackInterval, a->font);
+        HWND spin = CreateWindowExW(0, UPDOWN_CLASSW, L"", WS_CHILD | WS_VISIBLE | UDS_ARROWKEYS,
+            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(PlaybackSpin), GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(spin, UDM_SETBUDDY, reinterpret_cast<WPARAM>(a->playbackInterval), 0);
+        SendMessageW(spin, UDM_SETRANGE32, 1, 600); SendMessageW(spin, UDM_SETPOS32, 0, 6);
         a->route = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(RouteList), GetModuleHandleW(nullptr), nullptr); set_control_font(a->route, a->font);
         DragAcceptFiles(hwnd, TRUE); SetTimer(hwnd, kUiTimer, 100, nullptr); layout(*a); update_enabled(*a); return 0;
@@ -710,34 +936,54 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: paint(*a); return 0;
     case WM_DRAWITEM: draw_button(*a, reinterpret_cast<DRAWITEMSTRUCT*>(lp)); return TRUE;
     case WM_CTLCOLORLISTBOX: SetTextColor(reinterpret_cast<HDC>(wp), kInk); SetBkColor(reinterpret_cast<HDC>(wp), RGB(255, 255, 255)); return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    case WM_NOTIFY: {
+        auto* header = reinterpret_cast<NMHDR*>(lp);
+        if (header && header->idFrom == PlaybackSpin && header->code == UDN_DELTAPOS) {
+            auto* change = reinterpret_cast<NMUPDOWN*>(lp);
+            commit_playback_interval(*a, false);
+            a->playbackIntervalMs = std::clamp(a->playbackIntervalMs / 100 + change->iDelta, 1, 600) * 100;
+            display_playback_interval(*a);
+            if (a->playing) SetTimer(hwnd, kPlayTimer, a->playbackIntervalMs, nullptr);
+            return TRUE;
+        }
+        break;
+    }
     case WM_COMMAND: {
         int id = LOWORD(wp);
         if (id >= kPaletteStart && id < kPaletteStart + 11) { a->selectedColor = id - kPaletteStart; for (int c = 0; c <= 10; ++c) InvalidateRect(GetDlgItem(hwnd, kPaletteStart + c), nullptr, TRUE); return 0; }
-        if (a->running && (id == Open || id == Paste || id == Example || id == ImportBoard || id == Calibrate || id == Edit || id == SaveBoard)) return 0;
+        if ((a->running || a->screenMode != ScreenMode::Off || a->screenSelecting) &&
+            (id == Open || id == Paste || id == Example || id == ImportBoard || id == Calibrate || id == Edit || id == SaveBoard || id == ScreenAuto || id == ScreenHint)) return 0;
+        if (a->screenMode != ScreenMode::Off && (id == Start || id == Reset || id == Previous || id == Next || id == Play || id == RouteList || id == Export || id == ImageView)) return 0;
         switch (id) {
         case Mode: if (HIWORD(wp) == CBN_SELCHANGE) update_enabled(*a); break;
+        case PlaybackInterval: if (HIWORD(wp) == EN_KILLFOCUS) commit_playback_interval(*a); break;
         case Open: open_dialog(*a); break;
         case Paste: paste_image(*a); break;
         case Example: load_example(*a); break;
-        case ImageView: a->showImage = !a->showImage; SetWindowTextW(GetDlgItem(hwnd, ImageView), a->showImage ? L"盤面を表示" : L"元画像を表示"); InvalidateRect(hwnd, nullptr, FALSE); break;
+        case ImageView: a->showImage = !a->showImage; update_enabled(*a); InvalidateRect(hwnd, nullptr, FALSE); break;
         case Calibrate: calibration_dialog(*a); break;
-        case Edit: a->editMode = !a->editMode; if (a->editMode) { a->showImage = false; set_step(*a, 0); stop_play(*a); SetWindowTextW(GetDlgItem(hwnd, ImageView), L"元画像を表示"); }
-            SetWindowTextW(GetDlgItem(hwnd, Edit), a->editMode ? L"修正を終了" : L"盤面を修正"); update_enabled(*a); InvalidateRect(hwnd, nullptr, FALSE); break;
+        case Edit: if (a->haveBoard) { a->editMode = !a->editMode; if (a->editMode) { a->showImage = false; set_step(*a, 0); stop_play(*a); }
+            update_enabled(*a); InvalidateRect(hwnd, nullptr, FALSE); } break;
         case Start: start_solver(*a); break;
-        case Stop: a->cancel.store(true); a->detail = L"探索を停止しています。"; InvalidateRect(hwnd, nullptr, FALSE); break;
+        case Stop: if (a->screenMode != ScreenMode::Off) stop_screen(*a, L"探索と画面操作を中止しました。");
+            a->cancel.store(true); a->detail = L"探索を停止しています。"; InvalidateRect(hwnd, nullptr, FALSE); break;
+        case ScreenAuto: begin_screen(*a, ScreenMode::Automatic); break;
+        case ScreenHint: begin_screen(*a, ScreenMode::Hint); break;
+        case LiveStop: if (a->screenMode != ScreenMode::Off) stop_screen(*a, L"停止ボタンが押されたため中止しました。"); break;
         case Reset: stop_play(*a); set_step(*a, 0); break;
         case Previous: stop_play(*a); set_step(*a, a->step - 1); break;
         case Next: stop_play(*a); set_step(*a, a->step + 1); break;
-        case Play: if (a->playing) stop_play(*a); else if (!a->moves.empty()) { if (a->step == static_cast<int>(a->moves.size())) set_step(*a, 0); a->playing = true; SetWindowTextW(GetDlgItem(hwnd, Play), L"再生を停止"); SetTimer(hwnd, kPlayTimer, 650, nullptr); } break;
+        case Play: if (a->playing) stop_play(*a); else if (!a->moves.empty() && commit_playback_interval(*a)) { if (a->step == static_cast<int>(a->moves.size())) set_step(*a, 0); a->playing = true; SetWindowTextW(GetDlgItem(hwnd, Play), L"再生を停止"); SetTimer(hwnd, kPlayTimer, a->playbackIntervalMs, nullptr); } break;
         case RouteList: if (HIWORD(wp) == LBN_SELCHANGE) { stop_play(*a); int index = static_cast<int>(SendMessageW(a->route, LB_GETCURSEL, 0, 0)); if (index >= 0) set_step(*a, index); } break;
         case Export: export_route(*a); break;
-        case SaveBoard: save_board(*a); break;
+        case SaveBoard: if (a->haveBoard) save_board(*a); break;
         case ImportBoard: import_board(*a); break;
+        case ExitApp: SendMessageW(hwnd, WM_CLOSE, 0, 0); break;
         } return 0;
     }
-    case WM_LBUTTONDOWN: if (a->editMode && !a->running) edit_cell(*a, hit_cell(*a, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)), a->selectedColor); return 0;
+    case WM_LBUTTONDOWN: if (a->editMode && !a->running && a->screenMode == ScreenMode::Off) edit_cell(*a, hit_cell(*a, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)), a->selectedColor); return 0;
     case WM_RBUTTONUP: {
-        if (!a->editMode || a->running) return 0;
+        if (!a->editMode || a->running || a->screenMode != ScreenMode::Off) return 0;
         const int cell = hit_cell(*a, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); if (cell < 0) return 0;
         HMENU menu = CreatePopupMenu(); for (int c = 0; c <= 10; ++c) AppendMenuW(menu, MF_STRING, 1000 + c, kColorNames[c]);
         POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; ClientToScreen(hwnd, &p);
@@ -746,20 +992,30 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DROPFILES: {
         HDROP drop = reinterpret_cast<HDROP>(wp); wchar_t file[32768]{};
-        if (!a->running && DragQueryFileW(drop, 0, file, 32768)) open_path(*a, file); DragFinish(drop); return 0;
+        if (!a->running && a->screenMode == ScreenMode::Off && !a->screenSelecting && DragQueryFileW(drop, 0, file, 32768)) open_path(*a, file); DragFinish(drop); return 0;
     }
+    case WM_HOTKEY:
+        if ((wp == kEscapeHotkey || wp == kF8Hotkey) && a->screenMode != ScreenMode::Off)
+            stop_screen(*a, L"停止キーが押されたため中止しました。");
+        return 0;
     case kWorkerDone: consume_worker(*a); return 0;
     case WM_TIMER:
         if (wp == kUiTimer) { consume_worker(*a); if (a->running) InvalidateRect(hwnd, &a->sideCard, FALSE); }
         else if (wp == kPlayTimer) { set_step(*a, a->step + 1); if (a->step == static_cast<int>(a->moves.size())) stop_play(*a); }
+        else if (wp == kLiveTimer) tick_screen(*a);
         else if (wp == kSmokeTimer) {
             if (a->smokeSolve >= 0 && a->running) return 0;
-            a->smokeExitCode = a->haveBoard && capture_client(*a) ? 0 : 2; DestroyWindow(hwnd);
+            a->smokeExitCode = a->haveBoard && capture_window(*a) ? 0 : 2; DestroyWindow(hwnd);
         }
         return 0;
-    case WM_CLOSE: a->cancel.store(true); if (a->worker.joinable()) a->worker.join(); DestroyWindow(hwnd); return 0;
+    case WM_CLOSE:
+        if (a->screenMode != ScreenMode::Off) stop_screen(*a, L"アプリを終了します。", false);
+        a->cancel.store(true); if (a->worker.joinable()) a->worker.join(); DestroyWindow(hwnd); return 0;
     case WM_DESTROY:
-        a->cancel.store(true); if (a->worker.joinable()) a->worker.join(); KillTimer(hwnd, kUiTimer); KillTimer(hwnd, kPlayTimer);
+        a->cancel.store(true); if (a->worker.joinable()) a->worker.join(); KillTimer(hwnd, kUiTimer); KillTimer(hwnd, kPlayTimer); KillTimer(hwnd, kLiveTimer);
+        if (a->escapeRegistered) UnregisterHotKey(hwnd, kEscapeHotkey);
+        if (a->f8Registered) UnregisterHotKey(hwnd, kF8Hotkey);
+        desktop::destroy_hint();
         for (HFONT f : {a->font, a->fontSmall, a->fontTitle, a->fontSection, a->fontNumber}) if (f) DeleteObject(f);
         PostQuitMessage(a->smokeExitCode); return 0;
     }
@@ -774,7 +1030,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     auto setDpi = reinterpret_cast<DpiFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
     if (setDpi) setDpi(reinterpret_cast<HANDLE>(-4)); else SetProcessDPIAware();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES | ICC_UPDOWN_CLASS}; InitCommonControlsEx(&icc);
     WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = window_proc; wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(2));
     if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION); wc.lpszClassName = kClassName;
@@ -819,6 +1075,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
             if (msg.wParam == 'V') { SendMessageW(hwnd, WM_COMMAND, Paste, 0); handled = true; }
             else if (msg.wParam == 'O') { SendMessageW(hwnd, WM_COMMAND, Open, 0); handled = true; }
+            else if (msg.wParam == 'S') { SendMessageW(hwnd, WM_COMMAND, SaveBoard, 0); handled = true; }
         }
         if (!handled && !IsDialogMessageW(hwnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }

@@ -20,7 +20,7 @@ New-Item -ItemType Directory -Force .build | Out-Null
 & $resourceCompiler -I src src/resources.rc .build/resources.o
 if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
 $common = @('-std=c++17', '-O3', '-DNDEBUG', '-static', '-municode', '-pthread', '-Wl,--stack,8388608')
-& $compiler @common -mwindows src/winmain.cpp src/solver.cpp src/recognition.cpp .build/resources.o -lwindowscodecs -lole32 -lcomctl32 -lcomdlg32 -lshell32 -lgdi32 -luuid -o ColorTileSolver.exe
+& $compiler @common -mwindows src/winmain.cpp src/desktop.cpp src/live_playback.cpp src/solver.cpp src/recognition.cpp .build/resources.o -lwindowscodecs -lole32 -lcomctl32 -lcomdlg32 -lshell32 -lgdi32 -luuid -o ColorTileSolver.exe
 if ($LASTEXITCODE -ne 0) { throw 'GUI compilation failed.' }
 & $compiler @common src/solver.cpp src/cli.cpp -o ColorTileSolverCLI.exe
 if ($LASTEXITCODE -ne 0) { throw 'CLI compilation failed.' }
