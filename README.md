@@ -2,10 +2,17 @@
 
 カラータイルのスクリーンショットから盤面を読み取り、全消しするためのクリック手順を探す Windows 用アプリです。画像認識と探索を C++17 で実装し、GUI とコマンドラインから利用できます。
 
-**開発中です。このリポジトリではソースコードを管理しており、実行ファイルの配布・リリースはまだ行っていません。**
+Windows x64 向けの実行ファイルは [GitHub Releases](https://github.com/apiss2/ColorTileSolver/releases/latest) からダウンロードできます。ソースコードとビルド生成物は分けて管理しています。
 
 ![画面例](examples/app_preview.png)
 
+## ダウンロードと起動
+
+1. [最新リリース](https://github.com/apiss2/ColorTileSolver/releases/latest) の `ColorTileSolver-1.1.0-windows-x64.zip` をダウンロードします。
+2. ZIP をフォルダへすべて展開します。`examples/` も同じフォルダに残してください。
+3. 展開先の `ColorTileSolver.exe` を起動します。Python や追加の C++ ランタイムのインストールは不要です。
+
+Windows 10／11 の 64 ビット環境向けです。配布 ZIP には GUI、CLI、サンプル、説明書、ライセンスを含みます。ソースからビルドする場合は、このリポジトリを取得し、後述のビルド手順を使用してください。
 ## できること
 
 - PNG・JPEG・BMP などの画像から、タイルの位置と色を認識。
@@ -56,7 +63,7 @@ cmake --build .build --parallel
 
 ## 基本操作
 
-1. ビルドした `ColorTileSolver.exe` を起動します。
+1. 展開先、またはビルド先の `ColorTileSolver.exe` を起動します。
 2. 「ファイル」→「画像を開く」でスクリーンショットを選びます。「サンプルを開く」でも動作を試せます。`Ctrl+O`、`Ctrl+V`、画像のドラッグ＆ドロップも使用できます。
 3. 「盤面」→「元画像と格子を表示」で、認識した格子と画像の位置を確認します。
 4. 必要に応じて「盤面」メニューの「盤面を修正」や「認識位置を調整」で認識結果を直します。
@@ -113,6 +120,15 @@ Windows が前面化や入力を拒否するウィンドウ、管理者権限の
 大きな盤面では、全消し手順が見つかっても最短性の証明に時間がかかります。制限時間内に全消しや最短性の証明を必ず達成できる保証はありません。並列探索では同じ時間設定でも結果が変わる場合があります。
 
 ## コマンドライン版
+
+配布 ZIP を使用する場合は、展開先のフォルダで実行します。
+
+```powershell
+.\ColorTileSolverCLI.exe .\examples\sample.ctb --seconds 10 --threads 4 --output result.json
+```
+
+CMake でビルドした場合は、次のように実行します。
+
 
 ```powershell
 .\.build\ColorTileSolverCLI.exe .\examples\sample.ctb --seconds 10 --threads 4 --output result.json
